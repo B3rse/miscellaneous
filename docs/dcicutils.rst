@@ -1,6 +1,6 @@
-========================
-dcicutils for tibanna_ff
-========================
+=======================
+dcicutils for fourfront
+=======================
 
 Import json to manipulate json format and ff_utils from the dcicutils package.
 
