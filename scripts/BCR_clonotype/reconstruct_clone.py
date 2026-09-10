@@ -224,7 +224,7 @@ def read_mixcr_row(path, cdr3):
         return None
     with open(path, newline="") as handle:
         for row in csv.DictReader(handle, delimiter="\t"):
-            for col in ("nSeqCDR3", "cdr3nt", "cdr3", "nucleotideCDR3"):
+            for col in ("nSeqCDR3", "cdr3nt", "cdr3", "nucleotideCDR3", "nSeqImputedCDR3"):
                 if col in row and row[col].strip().upper() == cdr3:
                     return row
     return None
