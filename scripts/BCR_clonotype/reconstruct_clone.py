@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
-"""Reconstruct the observed V-region upstream of a BCR CDR3 from Archer molbar reads.
+"""Reconstruct observed BCR sequence around a CDR3 from Archer molbar reads.
 
+V-only output is the default; --full-sequence also reports CDR3 and J-side.
 One vote per molbar family. Inputs are trusted; if something is wrong, it crashes.
 """
 
@@ -153,12 +154,11 @@ def reconstruct_molbar(records, cdr3, min_overlap, max_mismatch):
 
 
 def build_coverage(molecules):
-    """Return upstream consensus rows; coverage counts callable A/C/G/T bases."""
+    """Return consensus rows; coverage counts callable A/C/G/T bases."""
     counts = defaultdict(Counter)
     for calls in molecules:
         for pos, base in calls.items():
-            if pos < 0:
-                counts[pos][base if base in "ACGT" else "N"] += 1
+            counts[pos][base if base in "ACGT" else "N"] += 1
     rows = []
     for pos in sorted(counts):
         c = counts[pos]
@@ -174,18 +174,27 @@ def build_coverage(molecules):
     return rows
 
 
-def observed_sequence(coverage_rows, min_cov):
-    """Longest contiguous well-supported walk from -1 upstream."""
+def observed_sequence(coverage_rows, min_cov, start=-1, step=-1):
+    """Return the contiguous supported sequence from a relative coordinate."""
     by_pos = {row[0]: row for row in coverage_rows}
     bases = []
-    pos = -1
+    pos = start
     while pos in by_pos:
         _, cons, cov, _, _ = by_pos[pos]
         if cov < min_cov or cons not in "ACGT":
             break
         bases.append(cons)
-        pos -= 1
-    return "".join(reversed(bases))
+        pos += step
+    if step < 0:
+        bases.reverse()
+    return "".join(bases)
+
+
+def write_fasta(path, header, seq):
+    with path.open("w") as handle:
+        handle.write(f">{header}\n")
+        for i in range(0, len(seq), 80):
+            handle.write(seq[i : i + 80] + "\n")
 
 
 def load_qnames(mapping_path, cdr3):
@@ -224,7 +233,13 @@ def read_mixcr_row(path, cdr3):
         return None
     with open(path, newline="") as handle:
         for row in csv.DictReader(handle, delimiter="\t"):
-            for col in ("nSeqCDR3", "cdr3nt", "cdr3", "nucleotideCDR3", "nSeqImputedCDR3"):
+            for col in (
+                "nSeqCDR3",
+                "cdr3nt",
+                "cdr3",
+                "nucleotideCDR3",
+                "nSeqImputedCDR3",
+            ):
                 if col in row and row[col].strip().upper() == cdr3:
                     return row
     return None
@@ -243,6 +258,11 @@ def main():
     parser.add_argument("--max-mismatch", type=float, default=0.10)
     parser.add_argument("--trim-poly-g", action="store_true")
     parser.add_argument("--poly-g-min-length", type=int, default=10)
+    parser.add_argument(
+        "--full-sequence",
+        action="store_true",
+        help="also write the observed V-CDR3-J-side sequence",
+    )
     args = parser.parse_args()
 
     cdr3 = args.cdr3.upper()
@@ -265,31 +285,56 @@ def main():
         recs = records.get(qname, [])
         if not recs:
             continue
-        molecules.append(reconstruct_molbar(recs, cdr3, args.min_overlap, args.max_mismatch))
+        molecules.append(
+            reconstruct_molbar(recs, cdr3, args.min_overlap, args.max_mismatch)
+        )
 
     anchored = sum(1 for m in molecules if m)
     if not anchored:
         raise SystemExit("No selected molbar families could be anchored on the CDR3")
     print(f"Anchored {anchored} / {len(qnames)} families on the CDR3", file=sys.stderr)
 
-    coverage = build_coverage(molecules)
+    all_coverage = build_coverage(molecules)
+    v_coverage = [row for row in all_coverage if row[0] < 0]
+    reported_coverage = all_coverage if args.full_sequence else v_coverage
 
     with (args.output_dir / "clone.coverage.tsv").open("w") as handle:
         handle.write("position\tconsensus\tcoverage\tA\tC\tG\tT\tN\tconsensus_fraction\n")
-        for pos, cons, cov, c, frac in coverage:
+        for pos, cons, cov, c, frac in reported_coverage:
             handle.write(
                 f"{pos}\t{cons}\t{cov}\t{c['A']}\t{c['C']}\t{c['G']}\t{c['T']}\t{c['N']}\t{frac:.4f}\n"
             )
 
-    v_seq = observed_sequence(coverage, args.min_coverage)
-    with (args.output_dir / "clone.observed_V.fasta").open("w") as handle:
-        handle.write(f">clone|CDR3={cdr3}|min_coverage={args.min_coverage}|length={len(v_seq)}\n")
-        for i in range(0, len(v_seq), 80):
-            handle.write(v_seq[i : i + 80] + "\n")
+    v_seq = observed_sequence(v_coverage, args.min_coverage)
+    write_fasta(
+        args.output_dir / "clone.observed_V.fasta",
+        f"clone|CDR3={cdr3}|min_coverage={args.min_coverage}|length={len(v_seq)}",
+        v_seq,
+    )
+
+    if args.full_sequence:
+        j_side_seq = observed_sequence(
+            all_coverage, args.min_coverage, start=len(cdr3), step=1
+        )
+        full_seq = v_seq + cdr3 + j_side_seq
+        header = (
+            f"clone|CDR3={cdr3}|min_coverage={args.min_coverage}|"
+            f"V_length={len(v_seq)}|CDR3_length={len(cdr3)}|"
+            f"J_side_length={len(j_side_seq)}|length={len(full_seq)}"
+        )
+        write_fasta(
+            args.output_dir / "clone.observed_V_CDR3_J.fasta", header, full_seq
+        )
 
     print("V length at coverage thresholds:", file=sys.stderr)
     for threshold in (1, 5, 10, 20, 50):
-        print(f"  >={threshold:>3}: {len(observed_sequence(coverage, threshold))} nt", file=sys.stderr)
+        length = len(observed_sequence(v_coverage, threshold))
+        print(f"  >={threshold:>3}: {length} nt", file=sys.stderr)
+    if args.full_sequence:
+        print("J-side length at coverage thresholds:", file=sys.stderr)
+        for threshold in (1, 5, 10, 20, 50):
+            length = len(observed_sequence(all_coverage, threshold, len(cdr3), 1))
+            print(f"  >={threshold:>3}: {length} nt", file=sys.stderr)
 
     mixcr_row = read_mixcr_row(args.mixcr_results, cdr3)
     if mixcr_row:
